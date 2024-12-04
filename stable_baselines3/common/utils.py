@@ -56,8 +56,8 @@ def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
         ev=1  =>  perfect prediction
         ev<0  =>  worse than just predicting zero
 
-    :param y_pred: the prediction
-    :param y_true: the expected value
+    :param y_pred: the prediction critic 
+    :param y_true: the expected value estimated from rollout 
     :return: explained variance of ypred and y
     """
     assert y_true.ndim == 1 and y_pred.ndim == 1
@@ -414,6 +414,8 @@ def safe_mean(arr: Union[np.ndarray, list, deque]) -> float:
     """
     return np.nan if len(arr) == 0 else float(np.mean(arr))  # type: ignore[arg-type]
 
+def safe_std(arr):
+    return np.nan if len(arr) == 0 else float(np.std(arr))  # type: ignore[arg-type]
 
 def get_parameters_by_name(model: th.nn.Module, included_names: Iterable[str]) -> List[th.Tensor]:
     """

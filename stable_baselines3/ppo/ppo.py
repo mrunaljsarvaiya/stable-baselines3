@@ -11,6 +11,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
+from jacobian import JacobianReg
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -199,6 +200,10 @@ class PPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
 
+        reg = JacobianReg() 
+        lambda_JR = 0.0 # hyperparameter
+        L2_alpha = 0 
+        
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -209,6 +214,9 @@ class PPO(OnPolicyAlgorithm):
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
+
+                # For jacobian regularization 
+                # rollout_data.observations.requires_grad = True
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
@@ -253,6 +261,9 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
+                # Regularization loss 
+                # R = reg(rollout_data.observations, values_pred.unsqueeze(1))   # Jacobian regularization
+                
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
