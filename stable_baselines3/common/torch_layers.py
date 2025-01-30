@@ -106,6 +106,25 @@ class NatureCNN(BaseFeaturesExtractor):
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.linear(self.cnn(observations))
 
+class CustomFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    :param observation_space: (gym.Space)
+    :param features_dim: (int) Number of features extracted.
+        This corresponds to the number of unit for the last layer.
+    """
+
+    def __init__(self, observation_space: gym.Space) -> None:
+        super().__init__(observation_space, get_flattened_obs_dim(observation_space))
+        self.flatten = nn.Flatten()
+        self.pretrained_model = None 
+    
+    # TODO Add custom features dom to account for additional input
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        # extract inputs from base model and add them to observations 
+        self.expert_inputs = None 
+
+        return self.flatten(observations)
+
 
 def create_mlp(
     input_dim: int,

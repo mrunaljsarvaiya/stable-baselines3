@@ -179,6 +179,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         :return: True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
+        t_start = time.time()
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
@@ -191,6 +192,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_start()
 
+        policy_call_t = 0 
+        step_t = 0 
+
+        t = time.time()
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
@@ -199,7 +204,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                t1 = time.time()
                 actions, values, log_probs = self.policy(obs_tensor)
+                policy_call_t += time.time() - t1
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -215,7 +222,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     # as we are sampling from an unbounded Gaussian distribution
                     clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
+            t1 = time.time()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            step_t += time.time() - t1
 
             self.num_timesteps += env.num_envs
 
@@ -241,6 +250,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 ):
                     terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
                     with th.no_grad():
+                        # print(f"type before {infos[idx]['terminal_observation'].dtype}")
+                        # print(f"type after {terminal_obs.dtype}")
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
 
@@ -255,15 +266,24 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
 
+        print(f"collecting rollouts took {(time.time() - t)} sec")
+        print(f"policy call tooks {policy_call_t} sec")
+        print(f"Step call tooks {step_t} sec")
+
         with th.no_grad():
+            t = time.time()
             # Compute value for the last timestep
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
-
+            print(f"predictr values took {(time.time() - t)} sec")
+        
+        t = time.time()
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
-
+        print(f"compute returns and advantage took {(time.time() - t)} sec")
         callback.update_locals(locals())
 
         callback.on_rollout_end()
+
+        print(f"collect_rollout() took {(time.time() - t_start)} sec")
 
         return True
 
@@ -325,7 +345,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         while self.num_timesteps < total_timesteps:
             continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
-
+            
             if not continue_training:
                 break
 

@@ -12,6 +12,8 @@ import torch as th
 from gymnasium import spaces
 from torch import nn
 from torch.distributions.normal import Normal
+import os 
+import gymnasium as gym
 
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
@@ -32,6 +34,7 @@ from stable_baselines3.common.torch_layers import (
     MlpExtractor,
     NatureCNN,
     create_mlp,
+    CustomFeaturesExtractor
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -1100,6 +1103,30 @@ class ActorCriticPolicyFiltered(BasePolicy):
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
         return actions, values, log_prob
 
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+        return actions, values, log_prob
+        
     def extract_features(  # type: ignore[override]
         self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
     ) -> Union[th.Tensor, Tuple[th.Tensor, th.Tensor]]:
@@ -1478,7 +1505,269 @@ class ActorCriticPolicySimple(BasePolicy):
         value = self.value_net(mlp_value_features)
         
         return value
+
+class CustomActorCriticPolicy(BasePolicy):
+    """
+    A minimal example of a custom actor-critic policy for continuous (Box) action spaces,
+    inheriting directly from BasePolicy.
     
+    This version does NOT use a feature extractor at all. Observations are
+    passed directly to simple MLPs: one for the policy (actor) and one for the value function (critic).
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        share_features_extractor: bool = True,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        pretrained_model=None,
+    ):
+        """
+        :param observation_space: (gym.Space) Observation space
+        :param action_space: (gym.Space) Action space (should be continuous: Box)
+        :param lr_schedule: (callable) Learning rate schedule, e.g. get_schedule_fn(3e-4)
+        :param net_arch: (tuple) Sizes of hidden layers for policy and value networks
+        :param activation_fn: (Type[nn.Module]) Activation function
+        :param optimizer_class: (Type[th.optim.Optimizer]) The optimizer to use
+        :param optimizer_kwargs: (dict) Additional optimizer parameters
+        """
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor_class,
+            features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=squash_output,
+            normalize_images=normalize_images,
+        )
+        
+        self.log_std_init = log_std_init
+        self.pretrained_nn = pretrained_model
+
+        # TODO FORCE overwrite the observation space due to our custom setup 
+        self.pretrained_features_dim = 64
+        total_dim = observation_space.shape[0] + self.pretrained_features_dim
+        self.actor_observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(total_dim,),
+            dtype=observation_space.dtype
+        )
+        self.value_observation_space = observation_space
+
+        # Make sure it's a continuous action space
+        if not isinstance(action_space, gym.spaces.Box):
+            raise ValueError("This policy only supports continuous (Box) action spaces.")
+
+        self.net_arch = net_arch
+        self.activation_fn = activation_fn
+        self.lr_schedule = lr_schedule
+        self.optimizer_kwargs = optimizer_kwargs or {}
+        self.action_dim = get_action_dim(self.action_space)
+
+        self._build(lr_schedule)
+
+        # Move model to the correct device
+        self.to(self.device)
+
+    def load_pretrained_model(self):
+        base_dir = os.path.join(os.getenv('RL_WS_DIR'), 'src', 'arpl_rl_mpc', 'data', 'models')
+        model_dir = f"{base_dir}/finetuned_model"
+
+        ppo_model = PPO.load(model_dir)
+        self.pretrained_nn = ppo_model.policy  # This is the ActorCriticPolicy object
+
+        for param in self.pretrained_nn.mlp_extractor.policy_net.parameters():
+            param.requires_grad = False
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        """
+        Create the networks and the optimizer.
+
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
+        # Build the policy (actor) network
+        obs_dim = np.array(self.actor_observation_space.shape).prod()  # Flattened obs size
+        action_dim = np.prod(self.action_space.shape)
+
+        # Define each layer as a class variable
+        self.fc1 = self._layer_init(
+            self._layer_init_zero(nn.Linear(obs_dim, 128))
+        )
+        self.fc2 = self._layer_init(
+            self._layer_init_zero(nn.Linear(128, 128))
+        )
+        self.fc3 = self._layer_init(
+            self._layer_init_zero(nn.Linear(128, action_dim)),
+            std=0.01
+        )
+        self.cbf_net = CBFNet()
+
+        # Build the value (critic) network
+        obs_dim = np.array(self.value_observation_space.shape).prod()  # Flattened obs size
+
+        self.value_net = nn.Sequential(
+            self._layer_init(self._layer_init_zero(nn.Linear(obs_dim, 64))),
+            nn.Tanh(),
+            self._layer_init(self._layer_init_zero(nn.Linear(64, 64))),
+            nn.Tanh(),
+            self._layer_init(self._layer_init_zero(nn.Linear(64, 1)), std=1)
+        )
+
+        # We use a diagonal Gaussian distribution for continuous actions
+        self.dist = DiagGaussianDistribution(self.action_dim)
+        _, self.log_std = self.dist.proba_distribution_net(
+            latent_dim=128, log_std_init=self.log_std_init)
+
+        # Setup optimizer with initial learning rate
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)  # type: ignore[arg-type, return-value]
+
+        data.update(
+            dict(
+                net_arch=self.net_arch,
+                activation_fn=self.activation_fn,
+                use_sde=self.use_sde,
+                log_std_init=self.log_std_init,
+                squash_output=default_none_kwargs["squash_output"],
+                full_std=default_none_kwargs["full_std"],
+                use_expln=default_none_kwargs["use_expln"],
+                lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+                ortho_init=self.ortho_init,
+                optimizer_class=self.optimizer_class,
+                optimizer_kwargs=self.optimizer_kwargs,
+                features_extractor_class=self.features_extractor_class,
+                features_extractor_kwargs=self.features_extractor_kwargs,
+            )
+        )
+        return data
+
+    def _layer_init(self, layer, std=np.sqrt(2), bias_const=0.0):
+        # print(f"calling 2 orth with gain {std}")
+        # print(f"layer weight shape {layer.weight.shape}")
+        nn.init.orthogonal_(layer.weight, gain=std)
+        # orthogonal_custom(layer.weight, gain=std, generator=self.g_cpu)
+
+        if layer.bias is not None:
+            layer.bias.data.fill_(bias_const)
+        return layer
+
+    def _layer_init_zero(self, layer, std=np.sqrt(2), bias_const=0.0):
+        nn.init.constant_(layer.weight, 0)
+
+        if layer.bias is not None:
+            layer.bias.data.fill_(bias_const)
+        return layer
+
+    def policy_net(self, state):
+        with th.no_grad():
+            features = self.pretrained_nn.mlp_extractor.policy_net[0](state)
+        
+        x = th.concatenate((features, state), dim=1)
+
+        x = self.fc1(x)
+        x = th.tanh(x)
+
+        x = self.fc2(x)
+        x = th.tanh(x)
+
+        x = self.fc3(x)
+        x = self.cbf_net(x, state)
+
+        return x 
+
+    def forward(self, obs: th.Tensor, deterministic: bool = False):
+        """
+        Forward pass through the policy and value networks.
+        Returns (mean_actions, log_std, value).
+        """
+        # Actor (policy) network for mean
+        mean_actions = self.policy_net(obs)
+        distribution = self.dist.proba_distribution(mean_actions, self.log_std)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+
+        # Critic (value) network
+        values = self.value_net(obs)
+
+        return actions, values, log_prob
+
+
+    def get_distribution(self, obs: th.Tensor):
+        """
+        Compute the DiagGaussianDistribution given current observation.
+        We obtain mean and log_std, then create the distribution object.
+        """
+        mean_actions = self.policy_net(obs)
+        distribution = self.dist.proba_distribution(mean_actions, self.log_std)
+        return distribution
+
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor):
+        """
+        Return the log probability, entropy, and value of given actions for given obs.
+        This is used by algorithms like PPO/A2C when computing the loss.
+        """
+        distribution = self.get_distribution(obs)
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+        values = self.value_net(obs)
+
+        return values, log_prob, entropy
+
+
+    def _predict(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        """
+        Used by the `predict()` method. Returns the action to take.
+        """
+        return self.get_distribution(obs).get_actions(deterministic=deterministic)
+
+    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs: Observation
+        :return: the estimated values.
+        """
+        if obs.dtype != np.float32:
+            return self.value_net(obs.float())
+
+        return self.value_net(obs)
+
+class CBFNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, u_nom, robot_state):
+        return u_nom
+
+
 class ActorCriticCnnPolicy(ActorCriticPolicy):
     """
     CNN policy class for actor-critic algorithms (has both policy and value prediction).
