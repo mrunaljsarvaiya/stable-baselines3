@@ -1580,7 +1580,7 @@ class CustomActorCriticPolicy(BasePolicy):
         if not isinstance(action_space, gym.spaces.Box):
             raise ValueError("This policy only supports continuous (Box) action spaces.")
 
-        self.net_arch = net_arch
+        # self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.lr_schedule = lr_schedule
         self.optimizer_kwargs = optimizer_kwargs or {}
@@ -1616,12 +1616,9 @@ class CustomActorCriticPolicy(BasePolicy):
         self.fc1 = self._layer_init(
             self._layer_init_zero(nn.Linear(obs_dim, 128))
         )
+        latent_dim = 128
         self.fc2 = self._layer_init(
-            self._layer_init_zero(nn.Linear(128, 128))
-        )
-        self.fc3 = self._layer_init(
-            self._layer_init_zero(nn.Linear(128, action_dim)),
-            std=0.01
+            self._layer_init_zero(nn.Linear(128, latent_dim))
         )
         self.cbf_net = CBFNet()
 
@@ -1639,7 +1636,7 @@ class CustomActorCriticPolicy(BasePolicy):
         # We use a diagonal Gaussian distribution for continuous actions
         self.dist = DiagGaussianDistribution(self.action_dim)
         _, self.log_std = self.dist.proba_distribution_net(
-            latent_dim=128, log_std_init=self.log_std_init)
+            latent_dim=latent_dim, log_std_init=self.log_std_init)
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
@@ -1697,7 +1694,6 @@ class CustomActorCriticPolicy(BasePolicy):
         x = self.fc2(x)
         x = th.tanh(x)
 
-        x = self.fc3(x)
         x = self.cbf_net(x, state)
 
         return x 
