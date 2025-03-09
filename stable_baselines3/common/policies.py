@@ -14,6 +14,7 @@ from torch import nn
 from torch.distributions.normal import Normal
 import os 
 import gymnasium as gym
+import time 
 
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
@@ -38,6 +39,8 @@ from stable_baselines3.common.torch_layers import (
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
+from acados_quad.solvers.export_sympy_model import hNet
+from gym_quad.envs.quad import OBS_IDX, OBS_WITH_OBSTACLE_IDX, RAW_STATE_IDX
 
 SelfBaseModel = TypeVar("SelfBaseModel", bound="BaseModel")
 
@@ -735,6 +738,7 @@ class ActorCriticPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
+
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
@@ -1563,11 +1567,12 @@ class CustomActorCriticPolicy(BasePolicy):
         )
         
         self.log_std_init = log_std_init
-        self.pretrained_nn = pretrained_model
+        self.pretrained_nn = pretrained_model.to(self.device)
 
         # TODO FORCE overwrite the observation space due to our custom setup 
         self.pretrained_features_dim = 64
         total_dim = observation_space.shape[0] + self.pretrained_features_dim
+        total_dim = self.pretrained_features_dim
         self.actor_observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -1582,24 +1587,19 @@ class CustomActorCriticPolicy(BasePolicy):
 
         # self.net_arch = net_arch
         self.activation_fn = activation_fn
+        self.activation = activation_fn()
         self.lr_schedule = lr_schedule
         self.optimizer_kwargs = optimizer_kwargs or {}
         self.action_dim = get_action_dim(self.action_space)
 
         self._build(lr_schedule)
 
+        self.min_action_limits = np.array([-3, -3, -3, 0])
+        self.max_action_limits = np.array([3, 3, 3, 20])
+
         # Move model to the correct device
+        print(f"CUSTOM ACTOR CRITIC DEVICE {self.device}")
         self.to(self.device)
-
-    def load_pretrained_model(self):
-        base_dir = os.path.join(os.getenv('RL_WS_DIR'), 'src', 'arpl_rl_mpc', 'data', 'models')
-        model_dir = f"{base_dir}/finetuned_model"
-
-        ppo_model = PPO.load(model_dir)
-        self.pretrained_nn = ppo_model.policy  # This is the ActorCriticPolicy object
-
-        for param in self.pretrained_nn.mlp_extractor.policy_net.parameters():
-            param.requires_grad = False
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
@@ -1613,14 +1613,41 @@ class CustomActorCriticPolicy(BasePolicy):
         action_dim = np.prod(self.action_space.shape)
 
         # Define each layer as a class variable
-        self.fc1 = self._layer_init(
-            self._layer_init_zero(nn.Linear(obs_dim, 128))
+        # self.fc1_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(obs_dim, 96))
+        # )
+        # self.fc2_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(96, 96))
+        # )
+        # self.fc3_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(96, action_dim))
+        # )
+
+        # self.fc1_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(obs_dim, 64))
+        # )
+        # self.fc2_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(64, 64))
+        # )
+        # self.fc3_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(64, 64))
+        # )
+        # self.fc4_actor = self._layer_init(
+        #     self._layer_init_zero(nn.Linear(64, action_dim))
+        # )
+
+        self.fc1_actor = self._layer_init(
+            self._layer_init_zero(nn.Linear(obs_dim, 64))
         )
-        latent_dim = 128
-        self.fc2 = self._layer_init(
-            self._layer_init_zero(nn.Linear(128, latent_dim))
+        self.fc2_actor = self._layer_init(
+            self._layer_init_zero(nn.Linear(obs_dim, 64))
         )
-        self.cbf_net = CBFNet()
+        self.fc3_actor = self._layer_init(
+            self._layer_init_zero(nn.Linear(64, action_dim), std=0.01)
+        )
+
+        # self.cbf_net = CBFNet(0.01)
+        self.cbf_net = hNet(2, 0.1, device='cuda')
 
         # Build the value (critic) network
         obs_dim = np.array(self.value_observation_space.shape).prod()  # Flattened obs size
@@ -1634,13 +1661,16 @@ class CustomActorCriticPolicy(BasePolicy):
         )
 
         # We use a diagonal Gaussian distribution for continuous actions
+        # latent dim is 4 since distribution is after cbf
         self.dist = DiagGaussianDistribution(self.action_dim)
         _, self.log_std = self.dist.proba_distribution_net(
-            latent_dim=latent_dim, log_std_init=self.log_std_init)
+            latent_dim=4, log_std_init=self.log_std_init)
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
-
+        self.cbf_optimizer = th.optim.Adam(
+            self.pretrained_nn.parameters(), lr=1e-3)
+    
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
 
@@ -1682,21 +1712,150 @@ class CustomActorCriticPolicy(BasePolicy):
             layer.bias.data.fill_(bias_const)
         return layer
 
+    def _scale_actions_to_si_units(self, action):
+        # inputs are between -1 and 1
+        # output in SI units
+        scaled_actions = th.zeros((action.shape)).to(self.device)
+        for i in range(4):
+            a = self.min_action_limits[i]
+            b = self.max_action_limits[i]
+            scaled_actions[:, i] = a + ((action[:, i] - (-1)) * (b - a) / (1 - (-1)))
+
+        return scaled_actions
+
+    def _scale_actions_to_one(self, u):
+        # inputs are in SI units
+        # outputs are between -1 and 1
+        scaled_actions = th.zeros((u.shape)).to(self.device)
+        for i in range(4):
+            a = self.min_action_limits[i]
+            b = self.max_action_limits[i]
+            scaled_actions[:, i] = -1 + ((u[:, i] - a) * (1 - (-1)) / (b - a))
+
+        return scaled_actions
+
+    # def policy_net(self, state):
+    #     with th.no_grad():
+    #         features = self.pretrained_nn.mlp_extractor.policy_net[0](
+    #             th.concatenate((state[:, 0:16], state[:, 19:23]), axis=1)
+    #             )
+
+    #     x = th.concatenate((features, state), dim=1)
+
+    #     x = self.fc1_actor(x)
+    #     x = self.activation(x)
+
+    #     x = self.fc2_actor(x)
+    #     x = self.activation(x)
+
+    #     u_unfiltered = self.fc3_actor(x)
+    #     # u_filtered = self.cbf_net(state, u_unfiltered)
+    #     u_filtered = u_unfiltered 
+
+    #     # u_delta_sq = th.square(u_unfiltered - u_filtered)
+    #     u_delta_sq = th.zeros_like(u_unfiltered) 
+
+    #     return u_filtered, u_delta_sq
+
     def policy_net(self, state):
-        with th.no_grad():
-            features = self.pretrained_nn.mlp_extractor.policy_net[0](state)
+        raise Exception()
+        # with th.no_grad():
+        # features = self.pretrained_nn.mlp_extractor.policy_net[0](th.concatenate((state[:, 0:16], state[:, 19:23]), axis=1))
+        # features = self.pretrained_nn.mlp_extractor.policy_net[1](features)
+        # features = self.pretrained_nn.mlp_extractor.policy_net[2](features)
+        # features = self.pretrained_nn.mlp_extractor.policy_net[3](features)
+        # u_unfiltered = self.pretrained_nn.action_net(features)
+
+        if self.device.type == 'cuda':
+            u_unfiltered = self.pretrained_nn(th.concatenate((state[:, 0:16], state[:, 19:23]), axis=1), deterministic=True)[0]
+        else:
+            u_unfiltered = th.tensor(self.pretrained_nn.predict(th.concatenate((state[:, 0:16], state[:, 19:23]), axis=1), deterministic=True)[0], device=self.device)
+        u_unfiltered_scaled_si_units = self._scale_actions_to_si_units(u_unfiltered)
         
-        x = th.concatenate((features, state), dim=1)
+        cbf_in = th.concatenate((
+            state[:, OBS_WITH_OBSTACLE_IDX.LOAD_POS: OBS_WITH_OBSTACLE_IDX.LOAD_POS + 3],
+            state[:, OBS_WITH_OBSTACLE_IDX.LOAD_VEL: OBS_WITH_OBSTACLE_IDX.LOAD_VEL + 3],
+            th.zeros((state.shape[0], 3)).to(state.device),
+            state[:, OBS_WITH_OBSTACLE_IDX.QUAD_VEL: OBS_WITH_OBSTACLE_IDX.QUAD_VEL + 3],
+            state[:, OBS_WITH_OBSTACLE_IDX.ROT: OBS_WITH_OBSTACLE_IDX.ROT + 4],
+            u_unfiltered_scaled_si_units[:, 3:4],
+            state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE:OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1],
+            state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1: OBS_WITH_OBSTACLE_IDX.OBSTACLE + 2]), 
+            axis=1)
+        
+        cbf_u_in = th.concatenate((
+            u_unfiltered_scaled_si_units[:, 0:3],
+            th.zeros((u_unfiltered_scaled_si_units.shape[0], 1), device=self.device),
+        ), axis=1)
 
-        x = self.fc1(x)
-        x = th.tanh(x)
+        u_filtered = self.cbf_net(cbf_in, cbf_u_in)
+        u_filtered = self._scale_actions_to_one(u_filtered)
 
-        x = self.fc2(x)
-        x = th.tanh(x)
+        u_delta_sq = th.mean(th.square(u_unfiltered - u_filtered), axis=1)
+        # import pdb; pdb.set_trace()
+        # if np.abs(u_filtered[0, 0]) > 1.0:
+        #     import pdb; pdb.set_trace
+        #     u_filtered = u_unfiltered
 
-        x = self.cbf_net(x, state)
+        # print(f"u_filtered: {u_filtered}")
+        # print(f"u_unfiltered: {u_unfiltered}")
 
-        return x 
+        return u_filtered, u_delta_sq
+
+    def policy_net2(self, state):
+        with th.no_grad():
+            features = self.pretrained_nn.mlp_extractor.policy_net[0](th.concatenate((state[:, 0:16], state[:, 19:23]), axis=1))
+            features = self.pretrained_nn.mlp_extractor.policy_net[1](features)
+            # features = self.pretrained_nn.mlp_extractor.policy_net[2](features)
+            # features = self.pretrained_nn.mlp_extractor.policy_net[3](features)
+            # u_unfiltered = self.pretrained_nn.action_net(features)
+
+
+        x = self.fc1_actor(features)
+        x = self.activation(x)
+        x = self.fc2_actor(x)
+        x = self.activation(x)
+        u_unfiltered = self.fc3_actor(x)
+
+        # u_unfiltered_scaled_si_units = self._scale_actions_to_si_units(u_unfiltered)
+        
+        # cbf_in = th.concatenate((
+        #     state[:, OBS_WITH_OBSTACLE_IDX.LOAD_POS: OBS_WITH_OBSTACLE_IDX.LOAD_POS + 3],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.LOAD_VEL: OBS_WITH_OBSTACLE_IDX.LOAD_VEL + 3],
+        #     th.zeros((state.shape[0], 3)).to(state.device),
+        #     state[:, OBS_WITH_OBSTACLE_IDX.QUAD_VEL: OBS_WITH_OBSTACLE_IDX.QUAD_VEL + 3],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.ROT: OBS_WITH_OBSTACLE_IDX.ROT + 4],
+        #     u_unfiltered_scaled_si_units[:, 3:4],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE:OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1: OBS_WITH_OBSTACLE_IDX.OBSTACLE + 2]), 
+        #     axis=1)
+        
+        # cbf_u_in = th.concatenate((
+        #     u_unfiltered_scaled_si_units[:, 0:3],
+        #     th.zeros((u_unfiltered_scaled_si_units.shape[0], 1), device=self.device),
+        # ), axis=1)
+
+        # u_filtered = self.cbf_net(cbf_in, cbf_u_in)
+        # u_filtered = self._scale_actions_to_one(u_filtered)
+        u_filtered = u_unfiltered 
+
+        u_delta_sq = th.mean(th.square(u_unfiltered - u_filtered), axis=1)
+        # import pdb; pdb.set_trace()
+        if th.any(th.abs(u_filtered[:, :]) > 2.0):
+            print("cbf failed")
+            # u_filtered = u_unfiltered
+
+        # print(f"u_filtered: {u_filtered}")
+        # print(f"u_unfiltered: {u_unfiltered}")
+
+        return u_filtered, u_delta_sq
+
+    def get_value(self, obs):
+        val = self.pretrained_nn(th.concatenate((obs[:, 0:16], obs[:, 19:23]), axis=1), deterministic=True)[1]
+        val = val + self.value_net(obs)
+
+        # val = self.value_net(obs)
+        return val 
 
     def forward(self, obs: th.Tensor, deterministic: bool = False):
         """
@@ -1704,16 +1863,16 @@ class CustomActorCriticPolicy(BasePolicy):
         Returns (mean_actions, log_std, value).
         """
         # Actor (policy) network for mean
-        mean_actions = self.policy_net(obs)
+        mean_actions, u_delta_sq = self.policy_net2(obs)
         distribution = self.dist.proba_distribution(mean_actions, self.log_std)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
 
         # Critic (value) network
-        values = self.value_net(obs)
+        values = self.get_value(obs)
 
-        return actions, values, log_prob
+        return actions, values, log_prob, u_delta_sq
 
 
     def get_distribution(self, obs: th.Tensor):
@@ -1721,28 +1880,32 @@ class CustomActorCriticPolicy(BasePolicy):
         Compute the DiagGaussianDistribution given current observation.
         We obtain mean and log_std, then create the distribution object.
         """
-        mean_actions = self.policy_net(obs)
+        t = time.time()
+        mean_actions, u_delta_sq = self.policy_net2(obs)
+        # print(f"policy_net time: {time.time() - t}")
+
         distribution = self.dist.proba_distribution(mean_actions, self.log_std)
-        return distribution
+        return distribution, u_delta_sq
 
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor):
         """
         Return the log probability, entropy, and value of given actions for given obs.
         This is used by algorithms like PPO/A2C when computing the loss.
         """
-        distribution = self.get_distribution(obs)
+        distribution, u_delta_sq = self.get_distribution(obs)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
-        values = self.value_net(obs)
+        values = self.get_value(obs)
 
-        return values, log_prob, entropy
+
+        return values, log_prob, entropy, u_delta_sq
 
 
     def _predict(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
         """
         Used by the `predict()` method. Returns the action to take.
         """
-        return self.get_distribution(obs).get_actions(deterministic=deterministic)
+        return self.get_distribution(obs)[0].get_actions(deterministic=deterministic)
 
     def predict_values(self, obs: PyTorchObs) -> th.Tensor:
         """
@@ -1752,12 +1915,12 @@ class CustomActorCriticPolicy(BasePolicy):
         :return: the estimated values.
         """
         if obs.dtype != np.float32:
-            return self.value_net(obs.float())
+            return self.get_value(obs.float())
 
-        return self.value_net(obs)
+        return self.get_value(obs)
 
 class CBFNet(nn.Module):
-    def __init__(self):
+    def __init__(self, dt):
         super().__init__()
 
     def forward(self, u_nom, robot_state):

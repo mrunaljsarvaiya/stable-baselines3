@@ -84,6 +84,9 @@ class Distribution(ABC):
         :param deterministic:
         :return:
         """
+        # if True:
+        #     return self.mode()
+        
         if deterministic:
             return self.mode()
         return self.sample()

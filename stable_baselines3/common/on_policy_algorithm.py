@@ -8,9 +8,9 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer, ReplayBufferMisc
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.policies import ActorCriticPolicy, CustomActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean, safe_std
 from stable_baselines3.common.vec_env import VecEnv
@@ -205,7 +205,17 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 t1 = time.time()
-                actions, values, log_probs = self.policy(obs_tensor)
+
+                if type(self.policy) == CustomActorCriticPolicy:
+                    actions, values, log_probs, u_delta_sq = self.policy(obs_tensor)
+                else:
+                    actions, values, log_probs = self.policy(obs_tensor)
+
+                # actions, values, log_probs = self.policy(obs_tensor)
+
+                # TODO Get cbf penalty from policy and add it to the rewards received after calling env.step 
+                # en(rewards) == len(penalties)
+                
                 policy_call_t += time.time() - t1
             actions = actions.cpu().numpy()
 
@@ -255,14 +265,25 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
 
-            rollout_buffer.add(
-                self._last_obs,  # type: ignore[arg-type]
-                actions,
-                rewards,
-                self._last_episode_starts,  # type: ignore[arg-type]
-                values,
-                log_probs,
-            )
+            if type(rollout_buffer) is ReplayBufferMisc:
+                rollout_buffer.add(
+                    self._last_obs,  # type: ignore[arg-type]
+                    actions,
+                    rewards,
+                    self._last_episode_starts,  # type: ignore[arg-type]
+                    values,
+                    log_probs,
+                    u_delta_sq
+                ) 
+            else:
+                rollout_buffer.add(
+                    self._last_obs,  # type: ignore[arg-type]
+                    actions,
+                    rewards,
+                    self._last_episode_starts,  # type: ignore[arg-type]
+                    values,
+                    log_probs,
+                )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
 

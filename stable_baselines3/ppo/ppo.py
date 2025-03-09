@@ -1,5 +1,6 @@
 import warnings
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
+import time 
 
 import numpy as np
 import torch as th
@@ -8,7 +9,7 @@ from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
-from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
+from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy, CustomActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 from jacobian import JacobianReg
@@ -197,7 +198,8 @@ class PPO(OnPolicyAlgorithm):
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
 
         entropy_losses = []
-        pg_losses, value_losses = [], []
+        pg_losses, value_losses, cbf_losses, cbf_filtered_hits = [], [], [], []
+        cbf_hits = []
         clip_fractions = []
 
         reg = JacobianReg() 
@@ -217,8 +219,11 @@ class PPO(OnPolicyAlgorithm):
 
                 # For jacobian regularization 
                 # rollout_data.observations.requires_grad = True
+                if type(self.policy) is CustomActorCriticPolicy:
+                    values, log_prob, entropy, u_delta_sq = self.policy.evaluate_actions(rollout_data.observations, actions)
+                else:
+                    values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -260,11 +265,11 @@ class PPO(OnPolicyAlgorithm):
                     entropy_loss = -th.mean(entropy)
 
                 entropy_losses.append(entropy_loss.item())
-
+                
                 # Regularization loss 
                 # R = reg(rollout_data.observations, values_pred.unsqueeze(1))   # Jacobian regularization
-                
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -288,6 +293,37 @@ class PPO(OnPolicyAlgorithm):
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
 
+
+                # Cbf loss 
+                cbf_loss = u_delta_sq
+                threshold = 0.3**2
+                indices = (cbf_loss > threshold).nonzero(as_tuple=True)
+                cbf_filtered_hits.append(len(indices[0]))
+                
+                cbf_hits.append(len((cbf_loss > 0.05 ** 2.0).nonzero(as_tuple=True)[0]))
+
+                if len(indices[0]) == 0:
+                    cbf_loss = th.tensor([0.0], device=cbf_loss.device) 
+                    cbf_losses.append(0)
+                elif len(indices[0]) == 1:
+                    cbf_loss = 0.001 * cbf_loss[indices[0]]
+                    cbf_losses.append(cbf_loss.item())
+                else:
+                    cbf_loss = 0.001 * th.mean(cbf_loss[indices[0]])
+                    cbf_losses.append(cbf_loss.item())
+
+                with th.no_grad():
+                    print(f"N violating indices {len(indices[0])} / {len(u_delta_sq)}")
+                    print(f"cbf loss {cbf_loss}")
+                    print(f"cbf mean {th.mean(cbf_loss)}")
+
+                # u_delta_sq_high, u_delta_sq_low = self.select_values(u_delta_sq, threshold)
+                # if u_delta_sq is not None:
+                    # cbf_loss = u_delta_sq_high + u_delta_sq_low
+                    # self.cbf_optimizer.optimizer.zero_grad()
+                    # cbf_loss.backward()
+                    # self.cbf_optimizer.step()
+
             self._n_updates += 1
             if not continue_training:
                 break
@@ -298,6 +334,9 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/cbf_loss", np.mean(cbf_losses))
+        self.logger.record("train/cbf_filtered_hits", np.mean(cbf_filtered_hits))
+        self.logger.record("train/cbf_hits", np.mean(cbf_hits))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
@@ -309,6 +348,30 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+
+    def select_values(self, X, thresh):
+        # Select elements greater than thresh
+        mask = X > thresh
+        X_greater = X[mask]
+        N = X_greater.size(0)
+        
+        if N == 0:
+            return None, None 
+
+        # Select remaining elements
+        X_remaining = X[~mask]
+        num_remaining = X_remaining.size(0)
+        
+        # Check if there are enough remaining elements
+        if num_remaining < N:
+            raise ValueError(f"Only {num_remaining} elements left, need {N}.")
+        
+        # Randomly sample N elements without replacement
+        rand_indices = torch.randperm(num_remaining)[:N]
+        X_sampled = X_remaining[rand_indices]
+        
+        return X_greater, X_sampled
 
     def learn(
         self: SelfPPO,
