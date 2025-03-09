@@ -1570,7 +1570,7 @@ class CustomActorCriticPolicy(BasePolicy):
         self.pretrained_nn = pretrained_model.to(self.device)
 
         # TODO FORCE overwrite the observation space due to our custom setup 
-        self.pretrained_features_dim = 64
+        self.pretrained_features_dim = 64 + 3
         total_dim = observation_space.shape[0] + self.pretrained_features_dim
         total_dim = self.pretrained_features_dim
         self.actor_observation_space = spaces.Box(
@@ -1637,13 +1637,13 @@ class CustomActorCriticPolicy(BasePolicy):
         # )
 
         self.fc1_actor = self._layer_init(
-            self._layer_init_zero(nn.Linear(obs_dim, 64))
+            self._layer_init_zero(nn.Linear(obs_dim, 96))
         )
         self.fc2_actor = self._layer_init(
-            self._layer_init_zero(nn.Linear(obs_dim, 64))
+            self._layer_init_zero(nn.Linear(96, 96))
         )
         self.fc3_actor = self._layer_init(
-            self._layer_init_zero(nn.Linear(64, action_dim), std=0.01)
+            self._layer_init_zero(nn.Linear(96, action_dim), std=0.01)
         )
 
         # self.cbf_net = CBFNet(0.01)
@@ -1810,12 +1810,54 @@ class CustomActorCriticPolicy(BasePolicy):
             # features = self.pretrained_nn.mlp_extractor.policy_net[3](features)
             # u_unfiltered = self.pretrained_nn.action_net(features)
 
-
+        features = th.concatenate((features, state[:,16:19]), dim=1)
         x = self.fc1_actor(features)
         x = self.activation(x)
         x = self.fc2_actor(x)
         x = self.activation(x)
         u_unfiltered = self.fc3_actor(x)
+
+        # u_unfiltered_scaled_si_units = self._scale_actions_to_si_units(u_unfiltered)
+        
+        # cbf_in = th.concatenate((
+        #     state[:, OBS_WITH_OBSTACLE_IDX.LOAD_POS: OBS_WITH_OBSTACLE_IDX.LOAD_POS + 3],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.LOAD_VEL: OBS_WITH_OBSTACLE_IDX.LOAD_VEL + 3],
+        #     th.zeros((state.shape[0], 3)).to(state.device),
+        #     state[:, OBS_WITH_OBSTACLE_IDX.QUAD_VEL: OBS_WITH_OBSTACLE_IDX.QUAD_VEL + 3],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.ROT: OBS_WITH_OBSTACLE_IDX.ROT + 4],
+        #     u_unfiltered_scaled_si_units[:, 3:4],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE:OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1],
+        #     state[:, OBS_WITH_OBSTACLE_IDX.OBSTACLE + 1: OBS_WITH_OBSTACLE_IDX.OBSTACLE + 2]), 
+        #     axis=1)
+        
+        # cbf_u_in = th.concatenate((
+        #     u_unfiltered_scaled_si_units[:, 0:3],
+        #     th.zeros((u_unfiltered_scaled_si_units.shape[0], 1), device=self.device),
+        # ), axis=1)
+
+        # u_filtered = self.cbf_net(cbf_in, cbf_u_in)
+        # u_filtered = self._scale_actions_to_one(u_filtered)
+        u_filtered = u_unfiltered 
+
+        u_delta_sq = th.mean(th.square(u_unfiltered - u_filtered), axis=1)
+        # import pdb; pdb.set_trace()
+        if th.any(th.abs(u_filtered[:, :]) > 2.0):
+            print("cbf failed")
+            # u_filtered = u_unfiltered
+
+        # print(f"u_filtered: {u_filtered}")
+        # print(f"u_unfiltered: {u_unfiltered}")
+
+        return u_filtered, u_delta_sq
+
+    def policy_net3(self, state):
+        x = self.fc1_actor(state)
+        x = self.activation(x)
+        x = self.fc2_actor(x)
+        x = self.activation(x)
+        x = self.fc3_actor(x)
+        x = self.activation(x)
+        unfiltered = self.fc4_actor(x)
 
         # u_unfiltered_scaled_si_units = self._scale_actions_to_si_units(u_unfiltered)
         
